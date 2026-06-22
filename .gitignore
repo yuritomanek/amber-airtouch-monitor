@@ -1,0 +1,27 @@
+# Secrets and local configuration. NEVER commit your real .env.
+.env
+
+# Runtime data: persisted state and audit log.
+data/
+monitor_state.json
+monitor.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

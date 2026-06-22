@@ -1,0 +1,39 @@
+# Docker Compose for the Raspberry Pi.
+#
+# Two services:
+#   energy-automation : your monitoring app (currently the connectivity test)
+#   homeassistant     : OPTIONAL. Only needed if you choose the Home Assistant
+#                       control path instead of controlling the AirTouch directly.
+#                       Commented out by default. See DEPLOYMENT.md.
+
+services:
+  energy-automation:
+    build: .
+    container_name: energy-automation
+    restart: unless-stopped
+    env_file: .env
+    # Persist the state file and audit log on the host so they survive restarts.
+    volumes:
+      - ./data:/app/data
+    environment:
+      - STATE_FILE=/app/data/monitor_state.json
+      - LOG_FILE=/app/data/monitor.log
+    # The container reaches the AirTouch (AIRTOUCH_HOST) and the Amber API
+    # over the default bridge network, which allows outbound LAN + internet.
+    # Runs the monitor (starts in DRY_RUN unless you set DRY_RUN=false in .env).
+    # To run the one-off connectivity test instead:
+    #   docker compose run --rm energy-automation python3 test_connection.py
+    command: ["python3", "monitor.py"]
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL: Home Assistant. Uncomment to use the Home Assistant control path.
+  # Host networking is recommended so HA can discover devices on your LAN.
+  # ---------------------------------------------------------------------------
+  # homeassistant:
+  #   image: ghcr.io/home-assistant/home-assistant:stable
+  #   container_name: homeassistant
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   volumes:
+  #     - ./homeassistant-config:/config
+  #     - /etc/localtime:/etc/localtime:ro
