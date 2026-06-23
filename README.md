@@ -36,6 +36,10 @@ off automatically instead of quietly running up the bill.
 - Edge-triggered with hysteresis and a cooldown, so it acts on threshold
   crossings and will not rapidly cycle the compressor.
 - Fails safe: if Amber is unreachable it does nothing and logs a warning.
+- Resilient to the AirTouch's IP changing: if its known address stops
+  answering, it scans the LAN for the unit, uses it, and remembers the new
+  address. It also retries a flaky connection and polls faster while an action
+  is pending.
 - Persists state to disk, so a restart or reboot does not lose track.
 
 It is also a generic pattern: the "price in, action out" core can drive any
@@ -146,6 +150,11 @@ All configuration lives in `.env` (see `.env.example`).
 | `FORECAST_LOOKAHEAD` | `3` | How many forecast intervals to check. |
 | `RESTORE_MODE` | (blank) | Force a mode on restore (HEAT/COOL/AUTO/...). Blank preserves current. |
 | `DRY_RUN` | `true` | Log decisions without switching the AC. |
+| `AIRTOUCH_CONNECT_RETRIES` | `3` | Retries for a flaky connection within one action. |
+| `AIRTOUCH_RETRY_DELAY_SECONDS` | `5` | Delay between those retries. |
+| `FAILED_RETRY_SECONDS` | `30` | Poll interval while an action is pending after a failure. |
+| `AIRTOUCH_AUTO_DISCOVER` | `true` | Scan the LAN for the AirTouch if its IP stops answering. |
+| `AIRTOUCH_DISCOVER_CIDR` | (auto) | Network to scan, e.g. `192.168.0.0/23`. Blank derives a /24 from the host. |
 
 ## Safety and disclaimer
 

@@ -34,6 +34,7 @@ Run:
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -95,6 +96,22 @@ class Config:
         self.poll_interval_s = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
         self.cooldown_minutes = float(os.environ.get("COOLDOWN_MINUTES", "15"))
         self.dry_run = _get_bool("DRY_RUN", True)
+
+        # AirTouch connection resilience. The console can drop off wifi. These
+        # retry a flaky connection within a single action, and poll faster while
+        # an action is needed but failing, so the monitor acts the moment the
+        # AirTouch comes back instead of waiting a full poll interval.
+        self.airtouch_connect_retries = int(os.environ.get("AIRTOUCH_CONNECT_RETRIES", "3"))
+        self.airtouch_retry_delay_s = float(os.environ.get("AIRTOUCH_RETRY_DELAY_SECONDS", "5"))
+        self.failed_retry_seconds = int(os.environ.get("FAILED_RETRY_SECONDS", "30"))
+
+        # Auto-discovery: if the configured IP stops answering (for example the
+        # AirTouch's DHCP lease changed), scan the local subnet for it on port
+        # 9200 and use the address found. The discovered IP is remembered.
+        self.airtouch_auto_discover = _get_bool("AIRTOUCH_AUTO_DISCOVER", True)
+        # CIDR to scan, e.g. "192.168.0.0/23". Blank = derive a /24 from
+        # AIRTOUCH_HOST. Set this if your LAN is larger than a /24.
+        self.airtouch_discover_cidr = os.environ.get("AIRTOUCH_DISCOVER_CIDR", "").strip()
 
         # Forecast-aware restore: before turning heating back on, look at the
         # next few forecast intervals. If any is about to be expensive or is
@@ -258,12 +275,62 @@ def forecast_is_risky(cfg: Config, forecasts: list[tuple[float, str]]) -> str | 
 
 
 # --------------------------------------------------------------------------
-# AirTouch: perform an off/on action, return (was_on, now_on)
+# AirTouch: discovery (find the unit if its IP changed)
 # --------------------------------------------------------------------------
-async def airtouch_action(host: str, turn_on: bool, mode: str | None, dry_run: bool) -> tuple[bool, bool]:
-    """Turn the AC on or off. If mode is given (e.g. "HEAT"), set that mode on
-    turn-on; if mode is None, leave the AC's existing mode untouched so it
-    returns to whatever it was (for example AUTO)."""
+AIRTOUCH_PORT = 9200
+
+
+async def _port_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def default_cidr_for(host: str) -> str:
+    """Best-effort /24 containing the host, used when no CIDR is configured."""
+    try:
+        return str(ipaddress.ip_network(f"{host}/24", strict=False))
+    except ValueError:
+        return f"{host.rsplit('.', 1)[0]}.0/24"
+
+
+async def discover_airtouch(cidr: str, exclude: str | None = None,
+                            timeout: float = 1.0, concurrency: int = 128) -> list[str]:
+    """Scan every host address in `cidr` for something listening on the AirTouch
+    port. Handles /24, /23 or any prefix. Returns candidate IPs (the configured
+    one excluded so new addresses are tried first). On a home LAN, port 9200 is
+    almost always just the AirTouch."""
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        logging.error("Invalid discovery CIDR '%s', skipping discovery.", cidr)
+        return []
+
+    hosts = [str(ip) for ip in network.hosts() if str(ip) != exclude]
+    found: list[str] = []
+    sem = asyncio.Semaphore(concurrency)
+
+    async def check(h: str) -> None:
+        async with sem:
+            if await _port_open(h, AIRTOUCH_PORT, timeout):
+                found.append(h)
+
+    await asyncio.gather(*(check(h) for h in hosts))
+    return found
+
+
+# --------------------------------------------------------------------------
+# AirTouch: perform an off/on action, returning (was_on, now_on, host_used)
+# --------------------------------------------------------------------------
+async def _try_host(host: str, turn_on: bool, mode: str | None, dry_run: bool) -> tuple[bool, bool]:
+    """One attempt against a single host. Raises on any failure."""
     from airtouch2.at2plus import At2PlusClient
     from airtouch2.protocol.at2plus.enums import AcSetMode
 
@@ -285,7 +352,7 @@ async def airtouch_action(host: str, turn_on: bool, mode: str | None, dry_run: b
                          "turn ON" if turn_on else "turn OFF",
                          mode_note, "ON" if was_on else "OFF")
             await client.stop()
-            return was_on, was_on  # no change in dry run
+            return was_on, was_on
 
         if turn_on:
             if mode:
@@ -315,8 +382,54 @@ async def airtouch_action(host: str, turn_on: bool, mode: str | None, dry_run: b
         raise
 
 
-def do_airtouch(host: str, turn_on: bool, mode: str | None, dry_run: bool) -> tuple[bool, bool]:
-    return asyncio.run(airtouch_action(host, turn_on, mode, dry_run))
+async def airtouch_action(host: str, turn_on: bool, mode: str | None, dry_run: bool,
+                          retries: int = 3, delay: float = 5.0,
+                          auto_discover: bool = True, cidr: str | None = None
+                          ) -> tuple[bool, bool, str]:
+    """Turn the AC on or off, with connection retries and optional LAN discovery
+    if the configured IP stops answering. Returns (was_on, now_on, host_used)."""
+    candidates = [host]
+    discovered = False
+    last_err: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        for cand in list(candidates):
+            try:
+                was_on, now_on = await _try_host(cand, turn_on, mode, dry_run)
+                return was_on, now_on, cand
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+
+        # Configured host (and any candidates) failed this round.
+        if auto_discover and not discovered:
+            scan_cidr = cidr or default_cidr_for(host)
+            logging.warning("AirTouch unreachable at %s. Scanning %s for it...", host, scan_cidr)
+            try:
+                found = await discover_airtouch(scan_cidr, exclude=host)
+            except Exception as e:  # noqa: BLE001
+                found = []
+                last_err = e
+            discovered = True
+            if found:
+                logging.warning("Found AirTouch candidate(s) on the network: %s", ", ".join(found))
+                candidates = found + [host]
+                continue  # retry immediately with discovered addresses
+            else:
+                logging.warning("Discovery found nothing on port %d in %s.", AIRTOUCH_PORT, scan_cidr)
+
+        if attempt < retries:
+            logging.warning("AirTouch attempt %d/%d failed (%s), retrying in %.0fs...",
+                            attempt, retries, last_err, delay)
+            await asyncio.sleep(delay)
+
+    raise last_err if last_err else ConnectionError(f"could not reach AirTouch (tried {candidates})")
+
+
+def do_airtouch(host: str, turn_on: bool, mode: str | None, dry_run: bool,
+                retries: int = 3, delay: float = 5.0,
+                auto_discover: bool = True, cidr: str | None = None) -> tuple[bool, bool, str]:
+    return asyncio.run(airtouch_action(host, turn_on, mode, dry_run, retries, delay,
+                                       auto_discover, cidr))
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +480,22 @@ def evaluate_once(cfg: Config, state: dict) -> dict:
         price, spot_str, data.estimate, data.duration, data.start,
         data.descriptor, data.spike, fc_summary, state["state"])
 
+    # Clear the fast-retry flag; it is set again only if an action fails below.
+    state["pending_action"] = False
+    # Use the last-known-good address (which may have been auto-discovered).
+    host = state.get("airtouch_host") or cfg.airtouch_host
+    cidr = cfg.airtouch_discover_cidr or None
+
+    def perform(turn_on: bool, mode: str | None) -> tuple[bool, bool]:
+        was_on, now_on, used = do_airtouch(
+            host, turn_on=turn_on, mode=mode, dry_run=cfg.dry_run,
+            retries=cfg.airtouch_connect_retries, delay=cfg.airtouch_retry_delay_s,
+            auto_discover=cfg.airtouch_auto_discover, cidr=cidr)
+        if used != host:
+            logging.warning("AirTouch address changed: %s -> %s. Remembering it.", host, used)
+            state["airtouch_host"] = used
+        return was_on, now_on
+
     if state["state"] == STATE_NORMAL:
         expensive = price >= cfg.upper_threshold_c or spike_now
         if expensive:
@@ -377,10 +506,10 @@ def evaluate_once(cfg: Config, state: dict) -> dict:
             reason = "spike flag" if spike_now and price < cfg.upper_threshold_c else f">= {cfg.upper_threshold_c} c/kWh"
             logging.warning("EXPENSIVE (%s). Curtailing heating.", reason)
             try:
-                was_on, now_on = do_airtouch(cfg.airtouch_host, turn_on=False,
-                                             mode=None, dry_run=cfg.dry_run)
+                was_on, now_on = perform(turn_on=False, mode=None)
             except Exception as e:  # noqa: BLE001
-                logging.error("Failed to turn AC off: %s. Will retry next cycle.", e)
+                logging.error("Failed to turn AC off: %s. Will retry shortly.", e)
+                state["pending_action"] = True  # poll faster until it succeeds
                 return state
             state["state"] = STATE_CURTAILED
             state["we_turned_off"] = bool(was_on)  # only restore if we actually turned it off
@@ -408,10 +537,10 @@ def evaluate_once(cfg: Config, state: dict) -> dict:
                 logging.warning("CHEAP (%.2f c/kWh <= %.2f). Restoring AC (%s).",
                                 price, cfg.lower_threshold_c, mode_note)
                 try:
-                    do_airtouch(cfg.airtouch_host, turn_on=True,
-                                mode=(cfg.restore_mode or None), dry_run=cfg.dry_run)
+                    perform(turn_on=True, mode=(cfg.restore_mode or None))
                 except Exception as e:  # noqa: BLE001
-                    logging.error("Failed to turn AC on: %s. Will retry next cycle.", e)
+                    logging.error("Failed to turn AC on: %s. Will retry shortly.", e)
+                    state["pending_action"] = True
                     return state
                 logging.warning("AC turned back ON.")
             else:
@@ -472,10 +601,14 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - never let the loop die
             logging.error("Cycle error: %s: %s", type(e).__name__, e)
 
+        # If an action is needed but failed (e.g. the AirTouch is briefly
+        # unreachable), poll faster so we act the moment it comes back.
+        interval = cfg.failed_retry_seconds if state.get("pending_action") else cfg.poll_interval_s
+
         # Sleep in small steps so signals stop us promptly.
         slept = 0
-        while _running and slept < cfg.poll_interval_s:
-            time.sleep(min(2, cfg.poll_interval_s - slept))
+        while _running and slept < interval:
+            time.sleep(min(2, interval - slept))
             slept += 2
 
     logging.info("Monitor stopped.")
