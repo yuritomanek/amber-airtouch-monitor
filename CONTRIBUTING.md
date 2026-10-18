@@ -31,13 +31,20 @@ Use the connectivity test to confirm your environment talks to both ends:
 python3 test_connection.py
 ```
 
+Run the unit tests (no network or hardware needed, standard library only):
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 ## Guidelines
 
 - Keep `DRY_RUN=true` while developing so you do not switch real hardware by
   accident. The monitor logs every decision in dry run.
-- The decision logic in `monitor.py` is covered by quick simulations. If you
-  change the state machine (thresholds, cooldown, forecast guard, restore
-  behaviour), please add or update a simulation so the edge cases stay verified.
+- The decision logic in `monitor.py` is covered by unit tests in
+  `tests/test_monitor.py`. If you change the state machine (thresholds,
+  cooldown, forecast guard, restore behaviour), please add or update a test so
+  the edge cases stay verified.
 - Avoid committing secrets. `.env`, `data/`, state and log files are gitignored.
 - This project depends on two community / generated libraries (`airtouch2` and
   `amberelectric`). They are pinned in `requirements.txt`. If you bump them,
