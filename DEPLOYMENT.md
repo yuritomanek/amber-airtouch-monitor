@@ -146,8 +146,7 @@ code, to validate the idea before building the app further.
 
 ## What comes next
 
-The monitoring service (poll Amber, apply upper and lower thresholds with edge
-detection, hysteresis and cooldown, fire the action, send a notification) is the
-next build phase. It will live alongside `test_connection.py` and run as the
-`energy-automation` container's main command. See `docs/ARCHITECTURE.md`
-for the design and the remaining phases.
+The monitor (`monitor.py`) is built and is the `energy-automation` container's
+default command. Planned additions, such as notifications when it switches and
+restoring the exact setpoint, are listed in the README roadmap. See
+`docs/ARCHITECTURE.md` for the reasoning behind the threshold logic.

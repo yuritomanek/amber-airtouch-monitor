@@ -14,7 +14,8 @@ Logic (edge-triggered with hysteresis and a cooldown):
 
   state = CURTAILED
       If price <= LOWER_THRESHOLD_C  AND  Amber is not flagging a spike:
-          if WE were the ones who turned it off, turn it back ON (heat mode),
+          if WE were the ones who turned it off, turn it back ON (previous mode
+          preserved unless RESTORE_MODE is set),
           move to state = NORMAL.
 
 Safety features:

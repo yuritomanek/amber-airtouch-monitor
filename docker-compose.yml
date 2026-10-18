@@ -1,7 +1,7 @@
 # Docker Compose for the Raspberry Pi.
 #
 # Two services:
-#   energy-automation : your monitoring app (currently the connectivity test)
+#   energy-automation : the price monitor (monitor.py)
 #   homeassistant     : OPTIONAL. Only needed if you choose the Home Assistant
 #                       control path instead of controlling the AirTouch directly.
 #                       Commented out by default. See DEPLOYMENT.md.
