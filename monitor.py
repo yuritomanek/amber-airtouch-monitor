@@ -217,6 +217,9 @@ def get_amber_data(cfg: Config) -> AmberData | None:
                     logging.error("Amber returned no sites.")
                     return None
                 site_id = sites[0].id
+                # Cache it so later polls skip the /sites call.
+                cfg.amber_site_id = site_id
+                logging.info("Using Amber site %s (set AMBER_SITE_ID to pin it).", site_id)
 
             want = max(0, cfg.forecast_lookahead)
             intervals = api.get_current_prices(
