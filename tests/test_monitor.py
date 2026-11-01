@@ -300,6 +300,7 @@ class AmberSiteCacheTests(unittest.TestCase):
     def fake_amber(self):
         class ChannelType:
             GENERAL = "general"
+            FEEDIN = "feedIn"
 
         class ApiException(Exception):
             status = reason = None
@@ -311,7 +312,11 @@ class AmberSiteCacheTests(unittest.TestCase):
 
         api = mock.MagicMock()
         api.get_sites.return_value = [types.SimpleNamespace(id="site-123")]
-        api.get_current_prices.return_value = [interval]
+        feedin = types.SimpleNamespace(
+            channel_type=ChannelType.FEEDIN, type="CurrentInterval", per_kwh=21.1)
+        feedin_fc = types.SimpleNamespace(
+            channel_type=ChannelType.FEEDIN, type="ForecastInterval", per_kwh=-3.0)
+        api.get_current_prices.return_value = [interval, feedin, feedin_fc]
 
         pkg = types.ModuleType("amberelectric")
         pkg.Configuration = mock.MagicMock()
@@ -338,12 +343,143 @@ class AmberSiteCacheTests(unittest.TestCase):
         self.assertEqual(cfg.amber_site_id, "site-123")
         self.assertEqual(api.get_current_prices.call_args.args[0], "site-123")
 
+    def test_feedin_channel_is_parsed_with_amber_sign(self):
+        modules, _ = self.fake_amber()
+        with mock.patch.dict(sys.modules, modules):
+            data = monitor.get_amber_data(make_cfg())
+        self.assertEqual(data.feedin, 21.1)
+        self.assertEqual(data.feedin_forecasts, [-3.0])
+        self.assertEqual(data.price, 42.0)
+
     def test_configured_site_id_skips_lookup(self):
         modules, api = self.fake_amber()
         cfg = make_cfg(AMBER_SITE_ID="mine")
         with mock.patch.dict(sys.modules, modules):
             monitor.get_amber_data(cfg)
         api.get_sites.assert_not_called()
+
+
+
+class InverterTests(unittest.TestCase):
+    """Inverter curtailment. Export cost is Amber's raw feed-in sign (positive =
+    exporting costs money). A full stop only pays when export cost > import."""
+
+    def setUp(self):
+        self.cfg = make_cfg(INVERTER_ENABLED="true", INVERTER_HOST="10.0.0.9")
+
+    def data(self, import_c=30.0, export_cost=-5.0, fc_cost=None, fc_import=None):
+        prices = fc_import if fc_import is not None else [import_c] * len(fc_cost or [])
+        d = make_data(import_c, forecasts=[(p, NONE) for p in prices])
+        d.feedin = export_cost
+        d.feedin_forecasts = fc_cost or []
+        return d
+
+    def cycle(self, state, data, cfg=None, error=None):
+        with mock.patch.object(monitor, "do_inverter") as inv:
+            if error:
+                inv.side_effect = error
+            else:
+                inv.return_value = "Normal"
+            new = monitor.evaluate_inverter(cfg or self.cfg, state, data)
+        return new, inv
+
+    def stopped(self, minutes_ago=60):
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+        return {"inverter_state": monitor.STATE_CURTAILED, "inverter_last_action_ts": ts,
+                "inverter_last_price_ts": datetime.now(timezone.utc).isoformat()}
+
+    def test_config_requires_host_and_hysteresis(self):
+        errors = make_cfg(INVERTER_ENABLED="true").validate()
+        self.assertIn("INVERTER_HOST must be set when INVERTER_ENABLED is true.", errors)
+        bad = make_cfg(INVERTER_ENABLED="true", INVERTER_HOST="x",
+                       INVERTER_RESTORE_MARGIN_C="0", INVERTER_CURTAIL_MARGIN_C="0")
+        self.assertTrue(any("hysteresis" in e for e in bad.validate()))
+
+    def test_normal_prices_do_nothing(self):
+        new, inv = self.cycle({}, self.data())
+        inv.assert_not_called()
+        self.assertNotEqual(new.get("inverter_state"), monitor.STATE_CURTAILED)
+
+    def test_small_export_cost_while_import_is_dearer_does_not_stop(self):
+        # Live midday data: import 11.3c, export cost 1.4c. A stop would lose
+        # free self-consumption, so do nothing.
+        new, inv = self.cycle({}, self.data(import_c=11.3, export_cost=1.4))
+        inv.assert_not_called()
+
+    def test_export_costs_more_than_import_stops(self):
+        new, inv = self.cycle({}, self.data(import_c=5.0, export_cost=33.0))
+        inv.assert_called_once()
+        self.assertEqual(new["inverter_state"], monitor.STATE_CURTAILED)
+
+    def test_yesterdays_real_1500_interval_stops(self):
+        new, _ = self.cycle({}, self.data(import_c=-11.9, export_cost=21.1))
+        self.assertEqual(new["inverter_state"], monitor.STATE_CURTAILED)
+
+    def test_negative_import_alone_stops(self):
+        new, inv = self.cycle({}, self.data(import_c=-1.0, export_cost=-40.0))
+        inv.assert_called_once()
+        self.assertEqual(new["inverter_state"], monitor.STATE_CURTAILED)
+
+    def test_stop_respects_cooldown(self):
+        recent = {"inverter_last_action_ts": datetime.now(timezone.utc).isoformat()}
+        _, inv = self.cycle(recent, self.data(import_c=5.0, export_cost=33.0))
+        inv.assert_not_called()
+
+    def test_stop_failure_sets_pending_and_stays_running(self):
+        new, _ = self.cycle({}, self.data(import_c=5.0, export_cost=33.0),
+                            error=RuntimeError("udp"))
+        self.assertTrue(new["inverter_pending"])
+        self.assertNotEqual(new.get("inverter_state"), monitor.STATE_CURTAILED)
+
+    def test_restart_when_import_is_dearer_than_export_cost(self):
+        new, inv = self.cycle(self.stopped(), self.data(import_c=11.3, export_cost=-0.02))
+        inv.assert_called_once()
+        self.assertEqual(new["inverter_state"], monitor.STATE_NORMAL)
+
+    def test_hysteresis_holds_inside_the_gap(self):
+        # Spread 1c: export is no longer worse than import, but under the 3c margin.
+        _, inv = self.cycle(self.stopped(), self.data(import_c=11.0, export_cost=10.0))
+        inv.assert_not_called()
+
+    def test_restart_held_when_forecast_spread_turns_bad(self):
+        d = self.data(import_c=30.0, export_cost=-5.0, fc_cost=[-5.0, 40.0], fc_import=[30.0, 10.0])
+        _, inv = self.cycle(self.stopped(), d)
+        inv.assert_not_called()
+
+    def test_restart_held_when_import_forecast_goes_negative(self):
+        d = self.data(import_c=30.0, export_cost=-5.0, fc_cost=[-5.0, -5.0], fc_import=[20.0, -1.0])
+        _, inv = self.cycle(self.stopped(), d)
+        inv.assert_not_called()
+
+    def test_missing_feedin_does_not_leave_inverter_stuck(self):
+        d = self.data(import_c=30.0)
+        d.feedin = None
+        new, inv = self.cycle(self.stopped(), d)
+        inv.assert_called_once()
+
+    def test_blind_failsafe_restarts(self):
+        state = self.stopped()
+        state["inverter_last_price_ts"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+        new, inv = self.cycle(state, None)
+        inv.assert_called_once()
+        self.assertEqual(new["inverter_state"], monitor.STATE_NORMAL)
+
+    def test_short_outage_keeps_inverter_stopped(self):
+        state = self.stopped()
+        state["inverter_last_price_ts"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        _, inv = self.cycle(state, None)
+        inv.assert_not_called()
+
+    def test_disabled_inverter_is_never_touched(self):
+        cfg = make_cfg()
+        with mock.patch.object(monitor, "get_amber_data",
+                               return_value=self.data(import_c=5.0, export_cost=33.0)), \
+             mock.patch.object(monitor, "do_airtouch", return_value=(True, True, cfg.airtouch_host)), \
+             mock.patch.object(monitor, "do_inverter") as inv:
+            monitor.evaluate_once(cfg, normal_state())
+        inv.assert_not_called()
 
 
 if __name__ == "__main__":

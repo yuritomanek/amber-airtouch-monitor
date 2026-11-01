@@ -156,6 +156,21 @@ All configuration lives in `.env` (see `.env.example`).
 | `AIRTOUCH_AUTO_DISCOVER` | `true` | Scan the LAN for the AirTouch if its IP stops answering. |
 | `AIRTOUCH_DISCOVER_CIDR` | (auto) | Network to scan, e.g. `192.168.0.0/23`. Blank derives a /24 from the host. |
 
+## GoodWe inverter curtailment (optional)
+
+Set `INVERTER_ENABLED=true` and `INVERTER_HOST` to also control a GoodWe
+inverter over the local network (UDP 8899, via the `goodwe` library). It stops
+the inverter when **exporting costs you more than importing** (or when importing
+pays you), and restarts it once the spread recovers and the forecast is clear.
+A full stop also loses free solar self-consumption, so a small export cost while
+the import price is high does *not* trigger it. Tested on a GW10KAU-DT.
+
+Amber's API reports the feed-in price with the sign flipped: a positive feed-in
+number means exporting *costs* you. The `INVERTER_*` margins in `.env.example`
+use that meaning. It shares `DRY_RUN` with the AC, uses its own state,
+and restarts the inverter on its own if Amber is unreachable for
+`INVERTER_MAX_BLIND_MINUTES` while it is stopped.
+
 ## Safety and disclaimer
 
 This software controls real heating and cooling hardware. Please read this.

@@ -125,6 +125,30 @@ class Config:
         # HEAT, COOL, AUTO, DRY or FAN only if you want to force a mode.
         self.restore_mode = os.environ.get("RESTORE_MODE", "").strip().upper()
 
+        # GoodWe inverter curtailment (optional, off by default). Amber reports
+        # the feed-in price with the sign flipped: a POSITIVE feed-in number
+        # means exporting COSTS you that many c/kWh, a negative one means you
+        # are paid. "export cost" below means that raw number.
+        #
+        # A full inverter stop also loses free solar self-consumption, so it only
+        # pays when exporting costs MORE than importing: stop when
+        #   export_cost - import_price > CURTAIL_MARGIN
+        # (or when importing pays you), restart when
+        #   import_price - export_cost >= RESTORE_MARGIN.
+        self.inverter_enabled = _get_bool("INVERTER_ENABLED", False)
+        self.inverter_host = os.environ.get("INVERTER_HOST", "").strip()
+        self.inverter_curtail_margin_c = float(os.environ.get("INVERTER_CURTAIL_MARGIN_C", "0"))
+        self.inverter_restore_margin_c = float(os.environ.get("INVERTER_RESTORE_MARGIN_C", "3"))
+        # Also stop when the import price is below this (0 = you are paid to import).
+        self.inverter_curtail_import_below_c = float(
+            os.environ.get("INVERTER_CURTAIL_IMPORT_BELOW_C", "0"))
+        self.inverter_cooldown_minutes = float(os.environ.get("INVERTER_COOLDOWN_MINUTES", "10"))
+        # Failsafe: if stopped and no valid Amber price for this long, restart
+        # anyway so an outage cannot leave your solar off indefinitely.
+        self.inverter_max_blind_minutes = float(os.environ.get("INVERTER_MAX_BLIND_MINUTES", "60"))
+        self.inverter_connect_retries = int(os.environ.get("INVERTER_CONNECT_RETRIES", "3"))
+        self.inverter_retry_delay_s = float(os.environ.get("INVERTER_RETRY_DELAY_SECONDS", "3"))
+
         self.state_file = os.environ.get("STATE_FILE", "monitor_state.json")
         self.log_file = os.environ.get("LOG_FILE", "monitor.log")
 
@@ -137,6 +161,13 @@ class Config:
                 f"LOWER_THRESHOLD_C ({self.lower_threshold_c}) must be below "
                 f"UPPER_THRESHOLD_C ({self.upper_threshold_c}) for hysteresis."
             )
+        if self.inverter_enabled:
+            if not self.inverter_host:
+                errors.append("INVERTER_HOST must be set when INVERTER_ENABLED is true.")
+            if self.inverter_restore_margin_c + self.inverter_curtail_margin_c <= 0:
+                errors.append(
+                    "INVERTER_RESTORE_MARGIN_C plus INVERTER_CURTAIL_MARGIN_C must be above 0 "
+                    "so there is a gap between stopping and restarting (hysteresis).")
         return errors
 
 
@@ -183,7 +214,12 @@ class AmberData:
     def __init__(self, price: float, descriptor: str, spike: str,
                  forecasts: list[tuple[float, str]],
                  spot: float | None = None, estimate: bool | None = None,
-                 start: str | None = None, duration: int | None = None) -> None:
+                 start: str | None = None, duration: int | None = None,
+                 feedin: float | None = None,
+                 feedin_forecasts: list[float] | None = None) -> None:
+        # Feed-in is Amber's raw sign: positive = exporting costs you c/kWh.
+        self.feedin = feedin
+        self.feedin_forecasts = feedin_forecasts or []
         self.price = price            # current per-kWh price in cents (total retail)
         self.descriptor = descriptor  # current PriceDescriptor
         self.spike = spike            # current SpikeStatus
@@ -246,8 +282,20 @@ def get_amber_data(cfg: Config) -> AmberData | None:
             if current is None:
                 current = general[0]
 
+            feedin_now: float | None = None
+            feedin_fc: list[float] = []
+            for i in unwrapped:
+                if getattr(i, "channel_type", None) != ChannelType.FEEDIN:
+                    continue
+                if "Forecast" in str(getattr(i, "type", "")):
+                    feedin_fc.append(float(getattr(i, "per_kwh")))
+                elif feedin_now is None:
+                    feedin_now = float(getattr(i, "per_kwh"))
+
             spot_val = getattr(current, "spot_per_kwh", None)
             return AmberData(
+                feedin=feedin_now,
+                feedin_forecasts=feedin_fc,
                 price=float(getattr(current, "per_kwh")),
                 descriptor=str(getattr(current, "descriptor", "?")),
                 spike=str(getattr(current, "spike_status", "?")),
@@ -467,9 +515,154 @@ def _handle_signal(signum, frame):  # noqa: ARG001
     _running = False
 
 
+# --------------------------------------------------------------------------
+# GoodWe inverter: stop when exporting costs money (or importing pays you)
+# --------------------------------------------------------------------------
+async def inverter_command(host: str, turn_on: bool, dry_run: bool,
+                           retries: int, delay: float) -> str:
+    """Send start/stop to a GoodWe inverter over local UDP. Returns the
+    work-mode label read back afterwards (best effort). Raises on failure."""
+    import goodwe  # imported lazily so the unit tests need no dependencies
+
+    verb = "start" if turn_on else "stop"
+    if dry_run:
+        logging.info("DRY RUN: would %s the inverter at %s.", verb, host)
+        return "dry-run"
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            inverter = await goodwe.connect(host, family="DT", timeout=4, retries=3)
+            await inverter.write_setting(verb, 1)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logging.warning("Inverter %s attempt %d/%d failed: %s", verb, attempt, retries, e)
+            await asyncio.sleep(delay)
+    else:
+        raise last_err if last_err else ConnectionError(f"could not reach inverter at {host}")
+    try:
+        await asyncio.sleep(3)
+        runtime = await inverter.read_runtime_data()
+        return str(runtime.get("work_mode_label", "?"))
+    except Exception:  # noqa: BLE001 - the command was accepted; read-back is optional
+        return "unknown"
+
+
+def do_inverter(host: str, turn_on: bool, dry_run: bool, retries: int, delay: float) -> str:
+    return asyncio.run(inverter_command(host, turn_on, dry_run, retries, delay))
+
+
+def inverter_curtail_reason(cfg: Config, data: AmberData) -> str | None:
+    """Why the inverter should be stopped right now, or None."""
+    if data.price < cfg.inverter_curtail_import_below_c:
+        return (f"importing pays {-data.price:.2f} c/kWh "
+                f"(price {data.price:.2f} < {cfg.inverter_curtail_import_below_c})")
+    if data.feedin is not None:
+        spread = data.feedin - data.price
+        if spread > cfg.inverter_curtail_margin_c:
+            return (f"exporting costs {data.feedin:.2f} c/kWh, {spread:.2f} more than "
+                    f"importing ({data.price:.2f})")
+    return None
+
+
+def inverter_restore_blocker(cfg: Config, data: AmberData) -> str | None:
+    """Why the inverter must stay stopped, or None if it is safe to restart."""
+    if data.price < cfg.inverter_curtail_import_below_c:
+        return f"import price {data.price:.2f} c/kWh still below {cfg.inverter_curtail_import_below_c}"
+    if data.feedin is not None:
+        gap = data.price - data.feedin
+        if gap < cfg.inverter_restore_margin_c:
+            return (f"import {data.price:.2f} is only {gap:.2f} c/kWh above export cost "
+                    f"{data.feedin:.2f} (need {cfg.inverter_restore_margin_c})")
+    if cfg.forecast_restore_guard:
+        look = max(0, cfg.forecast_lookahead)
+        for idx, (price, _) in enumerate(data.forecasts[:look], start=1):
+            if price < cfg.inverter_curtail_import_below_c:
+                return f"import forecast +{idx} is {price:.2f} c/kWh"
+        # Both forecast lists come from one Amber call, in time order.
+        for idx, (cost, (price, _)) in enumerate(
+                zip(data.feedin_forecasts[:look], data.forecasts[:look]), start=1):
+            if cost - price > cfg.inverter_curtail_margin_c:
+                return f"forecast +{idx}: export cost {cost:.2f} vs import {price:.2f} c/kWh"
+    return None
+
+
+def _minutes_since(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds() / 60.0
+    except ValueError:
+        return None
+
+
+def evaluate_inverter(cfg: Config, state: dict, data: AmberData | None) -> dict:
+    """One decision cycle for the inverter. Uses its own state keys so it never
+    interferes with the AC state machine."""
+    state["inverter_pending"] = False
+    stopped = state.get("inverter_state", STATE_NORMAL) == STATE_CURTAILED
+
+    def run(turn_on: bool) -> bool:
+        try:
+            label = do_inverter(cfg.inverter_host, turn_on, cfg.dry_run,
+                                cfg.inverter_connect_retries, cfg.inverter_retry_delay_s)
+        except Exception as e:  # noqa: BLE001
+            logging.error("Failed to %s inverter: %s. Will retry shortly.",
+                          "start" if turn_on else "stop", e)
+            state["inverter_pending"] = True
+            return False
+        logging.warning("Inverter %s (reports: %s).", "STARTED" if turn_on else "STOPPED", label)
+        state["inverter_state"] = STATE_NORMAL if turn_on else STATE_CURTAILED
+        state["inverter_last_action_ts"] = now_iso()
+        return True
+
+    if data is None:
+        if stopped:
+            blind = _minutes_since(state.get("inverter_last_price_ts"))
+            if blind is not None and blind >= cfg.inverter_max_blind_minutes:
+                logging.warning("No Amber price for %.0f min while inverter stopped. "
+                                "Restarting it as a failsafe.", blind)
+                run(turn_on=True)
+        return state
+
+    state["inverter_last_price_ts"] = now_iso()
+    cooling = cooldown_active({"last_action_ts": state.get("inverter_last_action_ts")},
+                              cfg.inverter_cooldown_minutes)
+    export_cost = "?" if data.feedin is None else f"{data.feedin:.2f}"
+    logging.info("Inverter | export cost %s c/kWh | import %.2f c/kWh | state=%s",
+                 export_cost, data.price, "stopped" if stopped else "running")
+
+    if not stopped:
+        reason = inverter_curtail_reason(cfg, data)
+        if reason:
+            if cooling:
+                logging.info("Inverter should stop (%s) but within cooldown, holding.", reason)
+            else:
+                logging.warning("Stopping inverter: %s.", reason)
+                run(turn_on=False)
+    else:
+        blocker = inverter_restore_blocker(cfg, data)
+        if blocker:
+            logging.info("Inverter stays stopped: %s.", blocker)
+        elif cooling:
+            logging.info("Inverter could restart but within cooldown, holding.")
+        else:
+            logging.warning("Prices have settled. Restarting inverter.")
+            run(turn_on=True)
+    return state
+
+
 def evaluate_once(cfg: Config, state: dict) -> dict:
-    """Run one decision cycle. Returns the (possibly updated) state."""
+    """Run one decision cycle for every enabled device. Returns the state."""
     data = get_amber_data(cfg)
+    state = _evaluate_ac(cfg, state, data)
+    if cfg.inverter_enabled:
+        state = evaluate_inverter(cfg, state, data)
+    return state
+
+
+def _evaluate_ac(cfg: Config, state: dict, data: AmberData | None) -> dict:
+    """AC decision cycle (unchanged logic, now fed pre-fetched price data)."""
     if data is None:
         logging.warning("No price this cycle, taking no action (fail safe).")
         return state
@@ -607,7 +800,8 @@ def main() -> int:
 
         # If an action is needed but failed (e.g. the AirTouch is briefly
         # unreachable), poll faster so we act the moment it comes back.
-        interval = cfg.failed_retry_seconds if state.get("pending_action") else cfg.poll_interval_s
+        pending = state.get("pending_action") or state.get("inverter_pending")
+        interval = cfg.failed_retry_seconds if pending else cfg.poll_interval_s
 
         # Sleep in small steps so signals stop us promptly.
         slept = 0

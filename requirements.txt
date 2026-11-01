@@ -2,3 +2,4 @@
 # These are community / generated libraries, so pin them and re-test before upgrading.
 amberelectric==2.0.12
 airtouch2==0.8.7
+goodwe==0.4.10
