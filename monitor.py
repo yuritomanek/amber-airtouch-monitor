@@ -560,8 +560,8 @@ def inverter_curtail_reason(cfg: Config, data: AmberData) -> str | None:
     if data.feedin is not None:
         spread = data.feedin - data.price
         if spread > cfg.inverter_curtail_margin_c:
-            return (f"exporting costs {data.feedin:.2f} c/kWh, {spread:.2f} more than "
-                    f"importing ({data.price:.2f})")
+            return (f"exporting costs you {data.feedin:.2f} c/kWh (app shows {-data.feedin:+.2f}), "
+                    f"{spread:.2f} more than importing ({data.price:.2f})")
     return None
 
 
@@ -572,8 +572,9 @@ def inverter_restore_blocker(cfg: Config, data: AmberData) -> str | None:
     if data.feedin is not None:
         gap = data.price - data.feedin
         if gap < cfg.inverter_restore_margin_c:
-            return (f"import {data.price:.2f} is only {gap:.2f} c/kWh above export cost "
-                    f"{data.feedin:.2f} (need {cfg.inverter_restore_margin_c})")
+            return (f"import {data.price:.2f} is only {gap:.2f} c/kWh above what exporting "
+                    f"costs ({-data.feedin:+.2f} c/kWh paid to you, as the Amber app shows it; "
+                    f"need a gap of {cfg.inverter_restore_margin_c})")
     if cfg.forecast_restore_guard:
         look = max(0, cfg.forecast_lookahead)
         for idx, (price, _) in enumerate(data.forecasts[:look], start=1):
@@ -583,7 +584,8 @@ def inverter_restore_blocker(cfg: Config, data: AmberData) -> str | None:
         for idx, (cost, (price, _)) in enumerate(
                 zip(data.feedin_forecasts[:look], data.forecasts[:look]), start=1):
             if cost - price > cfg.inverter_curtail_margin_c:
-                return f"forecast +{idx}: export cost {cost:.2f} vs import {price:.2f} c/kWh"
+                return (f"forecast +{idx}: export price {-cost:+.2f} (app sign) "
+                        f"vs import {price:.2f} c/kWh")
     return None
 
 
@@ -628,9 +630,11 @@ def evaluate_inverter(cfg: Config, state: dict, data: AmberData | None) -> dict:
     state["inverter_last_price_ts"] = now_iso()
     cooling = cooldown_active({"last_action_ts": state.get("inverter_last_action_ts")},
                               cfg.inverter_cooldown_minutes)
-    export_cost = "?" if data.feedin is None else f"{data.feedin:.2f}"
-    logging.info("Inverter | export cost %s c/kWh | import %.2f c/kWh | state=%s",
-                 export_cost, data.price, "stopped" if stopped else "running")
+    # Log the export price the way the Amber app shows it: positive = you are paid.
+    export_price = "?" if data.feedin is None else f"{-data.feedin:+.2f}"
+    logging.info("Inverter | export price %s c/kWh (+ = paid, as in the app) | "
+                 "import price %.2f c/kWh | state=%s",
+                 export_price, data.price, "stopped" if stopped else "running")
 
     if not stopped:
         reason = inverter_curtail_reason(cfg, data)
