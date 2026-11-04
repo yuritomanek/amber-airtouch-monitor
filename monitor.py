@@ -137,8 +137,8 @@ class Config:
         #   import_price - export_cost >= RESTORE_MARGIN.
         self.inverter_enabled = _get_bool("INVERTER_ENABLED", False)
         self.inverter_host = os.environ.get("INVERTER_HOST", "").strip()
-        self.inverter_curtail_margin_c = float(os.environ.get("INVERTER_CURTAIL_MARGIN_C", "5"))
-        self.inverter_restore_margin_c = float(os.environ.get("INVERTER_RESTORE_MARGIN_C", "5"))
+        self.inverter_curtail_margin_c = float(os.environ.get("INVERTER_CURTAIL_MARGIN_C", "0"))
+        self.inverter_restore_margin_c = float(os.environ.get("INVERTER_RESTORE_MARGIN_C", "3"))
         # Also stop when the import price is below this (0 = you are paid to import).
         self.inverter_curtail_import_below_c = float(
             os.environ.get("INVERTER_CURTAIL_IMPORT_BELOW_C", "0"))
