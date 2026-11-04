@@ -572,9 +572,9 @@ def inverter_restore_blocker(cfg: Config, data: AmberData) -> str | None:
     if data.feedin is not None:
         gap = data.price - data.feedin
         if gap < cfg.inverter_restore_margin_c:
-            return (f"import {data.price:.2f} is only {gap:.2f} c/kWh above what exporting "
-                    f"costs ({-data.feedin:+.2f} c/kWh paid to you, as the Amber app shows it; "
-                    f"need a gap of {cfg.inverter_restore_margin_c})")
+            return (f"restart needs import price + export price (app sign) of at least "
+                    f"{cfg.inverter_restore_margin_c:g} c/kWh, now "
+                    f"{data.price:.2f} + ({-data.feedin:.2f}) = {gap:.2f}")
     if cfg.forecast_restore_guard:
         look = max(0, cfg.forecast_lookahead)
         for idx, (price, _) in enumerate(data.forecasts[:look], start=1):
